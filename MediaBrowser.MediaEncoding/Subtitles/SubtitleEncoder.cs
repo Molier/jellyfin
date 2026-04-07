@@ -152,6 +152,23 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 return stream;
             }
 
+            // Try the streaming convert path first. This pipes the input stream
+            // through an incremental parser and an incremental writer, emitting
+            // cues to the HTTP response body as fast as ffmpeg can write them.
+            // Only valid when no time filtering / timestamp rewriting is
+            // requested, because the streaming path does not support those
+            // transforms yet.
+            if (startTimeTicks == 0 && endTimeTicks == 0 && !preserveOriginalTimestamps)
+            {
+                var streamingAdapter = Streaming.StreamingConverterFactory.TryCreate(stream, inputFormat, outputFormat, _logger);
+                if (streamingAdapter is not null)
+                {
+                    // The adapter takes ownership of `stream` and will dispose
+                    // it when the adapter is disposed.
+                    return streamingAdapter;
+                }
+            }
+
             using (stream)
             {
                 return ConvertSubtitles(stream, inputFormat, outputFormat, startTimeTicks, endTimeTicks, preserveOriginalTimestamps, cancellationToken);
