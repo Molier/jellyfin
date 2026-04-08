@@ -1,6 +1,7 @@
 #pragma warning disable CS1591
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -49,6 +50,13 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             o.PoolSize = 20;
             o.PoolInitialFill = 1;
         });
+
+        // Tracks background ExtractionTasks started via TryReturnEarly, keyed by output path.
+        // A second concurrent request for the same subtitle must see that extraction is still
+        // running so GetSubtitleStream can wrap the partial file in a TailingFileStream; without
+        // this, the fast-path returns a plain FileStream that closes on current-EOF and the
+        // client receives a valid-but-truncated response.
+        private readonly ConcurrentDictionary<string, Task> _inProgressExtractions = new(StringComparer.Ordinal);
 
         public SubtitleEncoder(
             ILogger<SubtitleEncoder> logger,
@@ -993,9 +1001,18 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 IsExternal = false
             };
 
-            // Fast path: subtitle already extracted and cached
+            // Fast path: subtitle already extracted and cached.
+            // Note: if another request is currently extracting the same file, propagate the
+            // still-running ExtractionTask so the caller wraps it in a TailingFileStream.
+            // Otherwise the second caller would receive a plain FileStream that closes on
+            // current-EOF and delivers a valid-but-truncated response.
             if (File.Exists(outputPath) && _fileSystem.GetFileInfo(outputPath).Length > 0)
             {
+                if (_inProgressExtractions.TryGetValue(outputPath, out var runningTask) && !runningTask.IsCompleted)
+                {
+                    return info with { ExtractionTask = runningTask };
+                }
+
                 return info;
             }
 
@@ -1029,6 +1046,15 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         {
             // Use CancellationToken.None so extraction continues even if this HTTP request completes
             var extractionTask = ExtractAllExtractableSubtitles(mediaSource, CancellationToken.None);
+
+            // Track the in-progress task so concurrent fast-path callers know to wrap in TailingFileStream.
+            _inProgressExtractions[outputPath] = extractionTask;
+            _ = extractionTask.ContinueWith(
+                _ => _inProgressExtractions.TryRemove(new KeyValuePair<string, Task>(outputPath, extractionTask)),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+
             var fileReadyTask = WaitForFileDataAsync(outputPath, TimeSpan.FromSeconds(30));
 
             var completedTask = await Task.WhenAny(extractionTask, fileReadyTask).ConfigureAwait(false);
